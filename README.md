@@ -8,6 +8,21 @@
 - **`eval_drone_core.py`**: 核心库。包含 PID 控制器、Benchmark 记录器 (绘图/计算 SPL 指标) 和 Runner 执行逻辑。
 - **`drone_server.py`**: 策略服务器 (Flask)。支持 Mock 几何导航和深度学习模型推理接口。
 
+## 🛠️ 环境配置 (Environment Setup)
+
+本项目基于 **NVIDIA Isaac Sim 5.0** 开发。为了确保可复现性，建议使用 Docker 容器运行。
+
+### 1. 拉取镜像
+本项目使用的 Docker 镜像名称为 `nvcr.io/nvidia/isaac-sim:5.0.0`，直接拉取镜像即可。
+目前已有Docker `isaacsim_benchmark`
+
+### 2. 依赖安装
+   ```bash
+   docker exec -it your_docker_name bash
+
+   /isaac-sim/python.sh -m pip install opencv-python matplotlib scipy flask json_numpy
+   ```
+
 ## 📦 资产配置 (Assets Setup)
 
 由于资产文件 (USD/Textures) 体积过大，未包含在代码仓库中。请按照以下步骤配置：
@@ -24,6 +39,7 @@ scenes资产在pro6000仿真服务器的/mnt/data0/datasets/Scene-N1/n1_eval_sce
    ```bash
    python debug/download_assets.py
 请联系我获取 robots 的资产压缩包，将无人机 .usd 文件解压到 robots 目录中。
+
 
 **最终的文件目录结构应严格如下所示**：
    ```text
