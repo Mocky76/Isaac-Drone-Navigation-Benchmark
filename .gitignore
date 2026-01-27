@@ -1,0 +1,22 @@
+# === Isaac Sim 垃圾文件 ===
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+
+# === 运行结果 (视频和JSON不要传) ===
+results/
+logs/
+*.mp4
+*.json
+
+# === 数据集 ===
+data/
+
+# === 大资产文件 (除非你自己做的很小的USD，否则别传) ===
+assets/**/*
+assets/*
+
+!assets/**/.gitkeep
+# === 系统文件 ===
+.DS_Store
