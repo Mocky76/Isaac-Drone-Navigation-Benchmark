@@ -45,11 +45,9 @@ scenes资产在pro6000仿真服务器的/mnt/data0/datasets/Scene-N1/n1_eval_sce
    ```text
    assets/
    ├── robots/
-   │   ├── .gitkeep
    │   ├── dronedemo.usd
    │   └── quadcopter.usd
    └── scenes/
-       ├── .gitkeep
        ├── cluttered_easy/
        ├── internscenes_commercial/
        ├── internscenes_home/
