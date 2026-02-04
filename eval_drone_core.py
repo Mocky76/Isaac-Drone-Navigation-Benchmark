@@ -8,6 +8,7 @@
 # 使用方法：本文件不需要在终端调用，由main.py文件调用
 # ==============================================================================
 import numpy as np
+import json_numpy
 import argparse
 import os
 import json
@@ -341,7 +342,7 @@ class DroneRunner:
         print(f"📷 [Setup] Global Map Size: {global_map_size:.1f}m")
         return global_map_size, mid_point
 
-    def run_episode(self, episode_data, map_size_info, max_steps=2000, physics_dt=1.0/60.0):
+    def run_episode(self, episode_data, map_size_info, max_steps=2000, K=5, is_stop=1e-5, physics_dt=1.0/60.0):
         """执行单局任务的主循环"""
         start_pos = episode_data['start_pos']
         goal_pos = episode_data['goal_pos']
@@ -406,6 +407,21 @@ class DroneRunner:
         controller = DroneController(kp_pos=30.0, kd_pos=1.0, kp_rot=15.0, max_speed=2.0)
 
         print(f"🚀 Running Episode {episode_id} | Goal: {goal_pos}")
+
+        # =========================================================================
+        # 动作缓冲池初始化
+        # =========================================================================
+        # 这里的 K 是你想连续执行的步数
+        K_EXEC_STEPS = K  
+        # 停止判定的阈值 (位移小于 10微米)
+        STOP_THRESHOLD = is_stop 
+        
+        # 动作队列：存放从Server拿回来的后续几步动作
+        # 使用 deque 或 list 都可以，pop(0) 即可
+        action_queue = [] 
+        # 计数器：记录当前这批动作已经执行了多少步
+        steps_since_inference = 0 
+        # =========================================================================
 
         while step_count < max_steps:
             # 1. [PHYSICS] 执行控制指令
@@ -489,19 +505,57 @@ class DroneRunner:
             #     "collision": is_col             # 碰撞检测
             # }
 
-            # [INFERENCE] 调用 Server 获取动作
-            response = self.client.query(obs)
+
+            # =============================================================
+            # 🔥 [NEW] 核心推理逻辑：Buffer 机制 🔥
+            # =============================================================           
+            # 初始化当前步的动作
+            dx, dy, dz, yaw_deg = 0.0, 0.0, 0.0, 0.0
             
-            dx, dy, dz, yaw_deg = 0, 0, 0, 0
+            # 判断是否需要请求 Server
+            # 条件：Buffer 空了 OR 已经执行了 K 步
+            need_inference = (len(action_queue) == 0) or (steps_since_inference >= K_EXEC_STEPS)
+
+            if need_inference:
+                # 1. 发送请求
+                response = self.client.query(obs)
+                # 2. 重置计数器
+                steps_since_inference = 0
+                action_queue = [] # 清空旧的（如果还有剩余的话，Receding Horizon通常丢弃剩余）
+
+                result = json_numpy.loads(response)
+                if isinstance(result, str):
+                    result = json_numpy.loads(result)
+
+                if result and "action" in result:
+                    # 获取 [N, 4] 的数组
+                    new_actions = result["action"] # 应该是一个 list of lists 或者 numpy array
+                    
+                    # 这里的 new_actions 如果是 list，可以直接用
+                    # 如果是 numpy，确保转为可迭代对象
+                    if hasattr(new_actions, 'tolist'):
+                        new_actions = new_actions.tolist()
+                    
+                    action_queue.extend(new_actions)
+
+            # --- 无论是否刚请求过，都从 Buffer 里取出一个动作执行 ---
+            if len(action_queue) > 0:
+                # 取出队首动作
+                current_action = action_queue.pop(0) 
+                dx, dy, dz, yaw_deg = current_action
+                steps_since_inference += 1
+            else:
+                # 万一 Server 挂了或者没返回东西，保持静止
+                dx, dy, dz, yaw_deg = 0, 0, 0, 0
+
+            # 自动 Stop 判定
             server_stop = False
-
-            if response:
-                if "action" in response:
-                    dx, dy, dz, yaw_deg = response["action"]
-                
-                if "stop" in response:
-                    server_stop = response["stop"]
-
+            # 检查绝对值是否足够小
+            if (abs(dx) < STOP_THRESHOLD and 
+                abs(dy) < STOP_THRESHOLD and 
+                abs(dz) < STOP_THRESHOLD):
+                server_stop = True
+            
             # 碰撞保护：撞墙后停止动作
             if is_col:
                 print("💥 撞墙了！强制刹车！")

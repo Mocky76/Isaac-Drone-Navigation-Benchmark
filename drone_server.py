@@ -7,16 +7,18 @@
 #   3. 返回控制指令 (Action)
 # 使用方法：: python drone_server.py
 # ==============================================================================
-from flask import Flask, request, jsonify
+from fastapi import FastAPI, Request
 import json_numpy
 import numpy as np
 import time
+import uvicorn
+import torch
 from scipy.spatial.transform import Rotation as R
 
 # 开启 numpy 序列化支持
 json_numpy.patch()
 
-app = Flask(__name__)
+app = FastAPI()
 
 # [MODEL INIT] 在这里加载模型
 # print("⏳ Loading Deep Learning Model...")
@@ -25,7 +27,7 @@ app = Flask(__name__)
 # model.to("cuda")
 # print("✅ Model Loaded!")
 
-@app.route("/reset", methods=["POST"])
+@app.post("/reset")
 def reset():
     """
     [LIFECYCLE] 重置接口
@@ -34,8 +36,8 @@ def reset():
 
     return jsonify({"status": "ok"})
 
-@app.route("/act", methods=["POST"])
-def act():
+@app.post("/act")
+def act(req: dict):
     """
     核心推理接口
     Input (JSON):
@@ -60,7 +62,7 @@ def act():
     STOP = False
 
     # 解析数据
-    req = json_numpy.loads(request.data)
+    # req = json_numpy.loads(request.data)
     obs = req["observation"]
 
     # #################################################################
@@ -70,70 +72,50 @@ def act():
     # 获取关键数据
     rgb_img = obs["rgb"]  
     depth = obs.get("depth")
-    
-    goal_pos = obs.get("goal_pose") # [3]
-    policy = obs.get("policy")      # [7] -> [x, y, z, qw, qx, qy, qz]
-    
-    # 2. 运行导航逻辑
-    if goal_pos is None or policy is None:
-        return json_numpy.dumps({"action": [0,0,0,0]})
 
-    current_pos = policy[:3]
-    current_ori = policy[3:] # [w, x, y, z]
+    # 假设预测步长 (Chunk Size)，截图里看起来像是 16
+    N = 16 
     
-    dist_to_goal = np.linalg.norm(goal_pos - current_pos)
+    # 初始化一个 [N, 4] 的 numpy 数组 (float32)
+    # 格式: [dx, dy, dz, dyaw]
+    pred_actions = np.zeros((N, 4), dtype=np.float32)
 
-    if dist_to_goal > 0.02:
-        direction = (goal_pos - current_pos) / dist_to_goal
-        # A. 计算位移 (3D)
-        raw_dx = (goal_pos[0] - current_pos[0]) 
-        raw_dy = (goal_pos[1] - current_pos[1])
-        raw_dz = (goal_pos[2] - current_pos[2])
-        
-        # 限制单步最大输出 (比如最大只允许输出 0.2m 的位移)，防止飞飞了
-        # 这种写法保留了方向和距离的比例关系
-        scale_factor = 0.2 # 调节这个！越大飞得越快
-        
-        # 简单的线性缩放：动作 = 距离向量 * 系数
-        # 如果距离很远，动作就会很大
-        dx = np.clip(raw_dx * scale_factor, -0.3, 0.3)
-        dy = np.clip(raw_dy * scale_factor, -0.3, 0.3)
-        dz = np.clip(raw_dz * scale_factor, -0.3, 0.3)
-        
-        # B. 计算转弯 (Yaw)
-        if dist_to_goal > 0.01:
-            target_yaw = np.arctan2(direction[1], direction[0])
+    # --- 获取测试用的导航目标 (仅用于生成假数据，实际接模型时不需要这部分) ---
+    goal_pos = obs.get("goal_pose") 
+    policy = obs.get("policy")
+    
+    if goal_pos is not None and policy is not None:
+        current_pos = policy[:3]
+        dist_to_goal = np.linalg.norm(goal_pos - current_pos)
+
+        # 简单的逻辑：如果还没到终点，就填充动作
+        if dist_to_goal > 0.02:
+            # 这里为了演示，我们计算第一步的动作，然后简单的复制给后面几步
+            # 在真实的 Diffusion Policy 中，每一步的动作通常是变化的（形成曲线）
             
-            # 转换四元数: Isaac [w,x,y,z] -> Scipy [x,y,z,w]
-            q_scipy = [current_ori[1], current_ori[2], current_ori[3], current_ori[0]]
-            curr_yaw = R.from_quat(q_scipy).as_euler('zyx')[0]
+            raw_dx = (goal_pos[0] - current_pos[0])
+            raw_dy = (goal_pos[1] - current_pos[1])
             
-            diff = target_yaw - curr_yaw
-            # 处理角度跳变
-            while diff > np.pi: diff -= 2*np.pi
-            while diff < -np.pi: diff += 2*np.pi
+            # 缩放系数
+            scale = 0.2
+            dx = np.clip(raw_dx * scale, -0.3, 0.3)
+            dy = np.clip(raw_dy * scale, -0.3, 0.3)
             
-            # 限制转速
-            raw_yaw_deg = np.clip(np.rad2deg(diff), -1.5, 1.5)
+            # 填充数组
+            # 示例：让未来 N 步都执行相同的向前动作（匀速直线运动）
+            # 真实模型推理出来的 action 会自带时序变化
+            pred_actions[:, 0] = dx  # dx
+            pred_actions[:, 1] = dy  # dy
+            pred_actions[:, 2] = 0.0 # dz
+            pred_actions[:, 3] = 0.1 # dyaw (简化)
+
+            # 为了让数据看起来更像截图里的真实数据（有微小噪声/变化），加一点随机抖动
+            noise = np.random.normal(0, 0.001, (N, 4))
+            pred_actions += noise
         else:
-            raw_yaw_deg = 0.0
+            # 到达终点，保持全 0，或者根据你的逻辑输出
+            pass
 
-        if dist_to_goal > 0.5:
-            decay = 1.0
-        elif dist_to_goal < 0.1:
-            decay = 0.0
-        else:
-            # 在 0.1 ~ 0.5m 之间，系数从 0 慢慢涨到 1
-            decay = (dist_to_goal - 0.1) / 0.4
-
-        final_yaw = np.clip(raw_yaw_deg, -10.0, 10.0) * decay
-        
-        # 打印日志方便看 Server 有没有在工作
-        print(f"[Server] Dist: {dist_to_goal:.2f}m | Action: [{dx:.2f}, {dy:.2f}, {dz:.2f}, {yaw_deg:.1f}]")
-    else:
-        print("[Server] Target Reached (Dist < 0.02m). Sending STOP signal.")
-        STOP = True
-        dx, dy, dz, final_yaw = 0.0, 0.0, 0.0, 0.0
 
     # #################################################################
     # #################################################################
@@ -155,28 +137,18 @@ def act():
 
     # 3. 模型推理
     # with torch.no_grad():
-    #     pred_action, pred_stop = model(tensor_img, inputs)
-        
-    # 4. 解析输出 (Post-processing)
-    # 假设模型输出是 [dx, dy, dz, dyaw]
-    # dx, dy, dz, yaw_deg = pred_action.cpu().numpy()[0]
-    # STOP = pred_stop.item() > 0.5
-
-    # 5. [可选] 安全限制 (Safety Guard)
-    # 如果生成的dx,dy,dz,yaw过大，可以在这里限制
-    # dx = np.clip(dx, -0.5, 0.5)
-    # final_yaw = np.clip(yaw_deg, -10.0, 10.0)
+    #     pred_action = model(tensor_img, inputs)
+    # pred_actions = pred_action.cpu().numpy()[0]
     # #################################################################
 
     # 返回结果
     response = {
-        "action": [dx, dy, dz, final_yaw],
-        "stop": STOP
+        "action": pred_actions
     }
     
     return json_numpy.dumps(response)
 
 if __name__ == "__main__":
-    # 启动 Flask 服务，监听 9009 端口
-    print(f"🚀 Drone Policy Server running on port 9009...")
-    app.run(host="0.0.0.0", port=9009, debug=False)
+    # 启动 Flask 服务，监听 9000 端口
+    print(f"🚀 Drone Policy Server running on port 9000...")
+    uvicorn.run(app, host="0.0.0.0", port=9000)
