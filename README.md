@@ -57,9 +57,14 @@ scenes资产在pro6000仿真服务器的/mnt/data0/datasets/Scene-N1/n1_eval_sce
    ```
 
 3. **数据集**：
-目前数据集没有整理和确定下来建议是建一个文件夹专门存放。具体数据集之后更新
+创建一个数据集文件夹datasets，并将数据集文件放到里面
    ```bash
-   mkdir -p data
+   mkdir -p datasets
+   ```
+
+也可以创建一个results文件，结果会保存在里面（不创建也没问题，会自动创建）
+   ```bash
+   mkdir -p results
    ```
 
 ## 🚀 快速开始
@@ -76,4 +81,6 @@ python drone_server.py
 python eval_drone_main.py
 
 # 运行真实数据集
-python eval_drone_main.py --dataset_path /path/to/lerobot_dataset
+# 这里dataset_path是真实数据集路径，scene是场景，path/to/sceneusd是指定场景的路径，但是注意是scenes下的相对路径且不带.usd后缀
+# 如要加载/assets/scenes/hospital/hospital.usd文件，path/to/sceneusd写成hospital/hospital即可
+python eval_drone_main.py --dataset_path ./datasets ----scene path/to/sceneusd
