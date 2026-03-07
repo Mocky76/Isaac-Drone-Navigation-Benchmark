@@ -13,6 +13,7 @@ import argparse
 import os
 import json
 import cv2
+import carb
 
 from scipy.spatial.transform import Rotation as R
 
@@ -53,9 +54,17 @@ class DroneController:
         Input: 当前状态 + 模型给出的 Action (dx, dy, dz, dyaw)
         Output: 目标线速度 + 目标角速度
         """
+        # 将局部位移指令转换回全局位移，以便输入给物理引擎
+        cos_y = np.cos(current_yaw)
+        sin_y = np.sin(current_yaw)
+        
+        global_dx = action_xyz[0] * cos_y - action_xyz[1] * sin_y
+        global_dy = action_xyz[0] * sin_y + action_xyz[1] * cos_y
+        global_dz = action_xyz[2]
+
         # 1. 期望位置 = 当前位置 + 模型输出的位移
         #    误差 Error = 期望位置 - 当前位置 = 模型输出的位移 (dx, dy, dz)
-        pos_error = np.array(action_xyz, dtype=np.float64)
+        pos_error = np.array([global_dx, global_dy, global_dz], dtype=np.float64)
         
         # 2. PD 控制公式: V_cmd = Kp * Error - Kd * V_current
         target_lin_vel = (self.kp_pos * pos_error) - (self.kd_pos * current_vel)
@@ -78,7 +87,8 @@ class DroneController:
 # 作用：绘制 FPV + Local Map + Global Plot 三合一图，并保存视频。
 # ==============================================================================
 class BenchmarkRecorder:
-    def __init__(self, start_pos, goal_pos, map_size=20.0, map_center_pos=None, gt_trajectory=None, target_waypoints=None, output_dir="results", goal_threshold=3.0):
+    def __init__(self, start_pos, goal_pos, map_size=20.0, map_center_pos=None, gt_trajectory=None, target_waypoints=None, output_dir="results", goal_threshold=0.5):
+        # goal_threshold是判决成功的距离，小于这个距离判定为成功
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
 
@@ -245,8 +255,8 @@ class BenchmarkRecorder:
 
         metrics = {
             "episode_id": episode_id,
-            "success": is_success,             # SR
-            "oracle_success": is_oracle_success, # OS
+            "success": float(is_success),             # SR
+            "oracle_success": float(is_oracle_success), # OS
             "navigation_error": float(ne),     # NE
             "spl": float(spl),                 # SPL
             "path_length": float(actual_path_len),
@@ -255,9 +265,9 @@ class BenchmarkRecorder:
             "total_steps": len(self.trajectory)
         }
         
-        json_path = os.path.join(self.output_dir, f"metrics_{episode_id}.json")
-        with open(json_path, "w") as f:
-            json.dump(metrics, f, indent=4)
+        # json_path = os.path.join(self.output_dir, f"metrics_{episode_id}.json")
+        # with open(json_path, "w") as f:
+        #     json.dump(metrics, f, indent=4)
             
         print("-" * 40)
         print(f"📊 测试报告 (Episode {episode_id})")
@@ -267,6 +277,8 @@ class BenchmarkRecorder:
         print(f"   Nav Error (NE): {ne:.2f} m")
         print(f"   Collisions: {self.collisions}")
         print("-" * 40)
+
+        return metrics
 
 # ==============================================================================
 # [RUNNER] 执行器
@@ -284,20 +296,33 @@ class DroneRunner:
 
     def setup_drone(self, drone_usd_path, start_pos, goal_pos):
         """每局开始前调用：加载无人机、设置相机、配置刚体"""
+        # ==========================================================
+        # 🌟 采用 RTX 渲染设置 🌟
+        # ==========================================================
+        settings = carb.settings.get_settings()
+        settings.set("/rtx/reflections/enabled", True)
+        settings.set("/rtx/shadows/enabled", True)
+        settings.set("/rtx/post/autoExposure/enabled", True) 
+        settings.set("/rtx/post/histogram/enabled", True)
+        settings.set("/rtx/post/histogram/whiteScale", 2.0) # 觉得暗可以调到 3.0 或 4.0
+        settings.set("/app/renderer/waitIdle", True)
+        settings.set("/rtx/hydra/enabled", True)
+        # ==========================================================
+
         if not os.path.exists(drone_usd_path):
             print(f"❌ 致命错误: 找不到无人机文件: {drone_usd_path}", flush=True)
             return None, None
         # 1. 加载无人机 
         if not prim_utils.is_prim_path_valid(self.drone_path):
             prim_utils.create_prim(self.drone_path, "Xform", usd_path=drone_usd_path, position=start_pos)
+            self.drone = RigidPrim(self.drone_path, name="drone_rigid")
+            self.world.scene.add(self.drone)
         else:
             # 如果无人机还在，直接瞬移到起点
-            drone_prim = RigidPrim(self.drone_path)
-            drone_prim.set_world_pose(position=start_pos)
-  
-        self.drone = RigidPrim(self.drone_path, name="drone_rigid")
-        if not self.world.scene.object_exists("drone_rigid"):
-            self.world.scene.add(self.drone)
+            if self.drone is not None:
+                self.drone.set_world_pose(position=start_pos)
+                self.drone.set_linear_velocity(np.zeros(3))
+                self.drone.set_angular_velocity(np.zeros(3))
 
         # 2. 设置相机
         desired_path = f"{self.drone_path}/chassis/front_cam"
@@ -311,28 +336,36 @@ class DroneRunner:
             target_cam_path = f"{self.drone_path}/front_cam" # 挂到根目录下
 
         # 设置 FPV 相机 (输入给模型的图)
-        self.camera_fpv = Camera(
-            prim_path=f"{self.drone_path}/chassis/front_cam",
-            position=np.array([0.5, 0.0, 0.6]),
-            frequency=20, resolution=(640, 360),
-            orientation=np.array([1.0, 0.0, 0.0, 0.0])
-        )
-        self.camera_fpv.initialize()
-        self.camera_fpv.add_distance_to_image_plane_to_frame() 
+        if self.camera_fpv is None:
+            self.camera_fpv = Camera(
+                prim_path=target_cam_path,
+                translation=np.array([0.0, 0.0, 0.0]),
+                frequency=20, resolution=(640, 360),
+                orientation=np.array([1.0, 0.0, 0.0, 0.0])
+            )
+            self.camera_fpv.initialize()
+            self.camera_fpv.add_distance_to_image_plane_to_frame() 
+
 
         # 设置 Local Map 相机 (跟随无人机，用于右上角小图)
-        map_center = np.array([start_pos[0], start_pos[1], 12.0])
-        self.camera_map = Camera(
-            prim_path="/World/MapCamera",
-            position=map_center,
-            frequency=20, resolution=(640, 640),
-            orientation=np.array([0.7071, 0.0, 0.7071, 0.0])
-        )
-        self.camera_map.set_projection_type("orthographic")
-        # ⚠️俯视图模糊等问题可以调下面这两个光圈，一般12/20/40这几个值比较合适
-        self.camera_map.set_horizontal_aperture(20.0)
-        self.camera_map.set_vertical_aperture(20.0)
-        self.camera_map.initialize()
+        # map_center = np.array([start_pos[0], start_pos[1], 12.0])
+        map_center = np.array([start_pos[0], start_pos[1], start_pos[2] + 1.5])
+        if self.camera_map is None:
+            self.camera_map = Camera(
+                prim_path="/World/MapCamera",
+                position=map_center,
+                frequency=20, resolution=(640, 640),
+                orientation=np.array([0.7071, 0.0, 0.7071, 0.0])
+            )
+            self.camera_map.set_projection_type("orthographic")
+            # ⚠️俯视图模糊等问题可以调下面这两个光圈，一般12/20/40这几个值比较合适
+            self.camera_map.set_horizontal_aperture(20.0)
+            self.camera_map.set_vertical_aperture(20.0)
+            self.camera_map.initialize()
+        else:
+            # 如果是第二集，仅仅更新一下俯视相机的起始位置即可
+            self.camera_map.set_world_pose(position=map_center)
+        
 
         # 3. 计算全局画图板需要的尺寸 (给 Recorder 用的黑底图)
         mid_point = (start_pos + goal_pos) / 2
@@ -354,6 +387,7 @@ class DroneRunner:
 
         # 1. 初始化刚体及物理状态重置
         self.world.reset()
+                
         try:
             self.drone.enable_rigid_body_physics()
             self.drone.set_mass(1.0)
@@ -361,6 +395,16 @@ class DroneRunner:
             prim = prim_utils.get_prim_at_path(self.drone_path)
             PhysxSchema.PhysxRigidBodyAPI.Apply(prim).CreateDisableGravityAttr().Set(True)
         except: pass
+
+        self.world.step(render=False)
+        if self.drone is not None:
+            self.drone.set_world_pose(position=start_pos)
+            self.drone.set_linear_velocity(np.zeros(3))
+            self.drone.set_angular_velocity(np.zeros(3))
+            
+            # 给物理引擎几帧时间来消化这个瞬移操作
+            for _ in range(5):
+                self.world.step(render=False)
 
         # 2. 预热物理引擎
         for _ in range(20): self.world.step(render=True)
@@ -374,19 +418,27 @@ class DroneRunner:
         # 说明：正式接 Server 时，把下面这块定义 waypoints 的代码删掉！
         # #################################################################
         # 即使 Main 传进来一个目标，我们这里强行改写成一组折线，为了测试转弯
-        waypoints = []
-        total_steps = 32
-        vec_to_goal = goal_pos - start_pos
-        total_dist = np.linalg.norm(vec_to_goal)
-        if total_dist > 0.01:
-            for i in range(total_steps):
-                t = i / (total_steps - 1) # 确保最后一个点 t=1.0，完全重合
-                # 线性插值基准线
-                p = (1-t) * start_pos + t * goal_pos
-                p[1] += 0.2 * np.sin(t * np.pi) 
-                waypoints.append(p)
-        else:
-            waypoints.append(goal_pos)
+        # waypoints = []
+        # total_steps = 32
+        # vec_to_goal = goal_pos - start_pos
+        # total_dist = np.linalg.norm(vec_to_goal)
+        # if total_dist > 0.01:
+        #     for i in range(total_steps):
+        #         t = i / (total_steps - 1) # 确保最后一个点 t=1.0，完全重合
+        #         # 线性插值基准线
+        #         p = (1-t) * start_pos + t * goal_pos
+        #         p[1] += 0.2 * np.sin(t * np.pi) 
+        #         waypoints.append(p)
+        # else:
+        #     waypoints.append(goal_pos)
+
+
+        # if gt_traj is not None and len(gt_traj) > 0:
+        #     # 直接使用解析出来的真实轨迹作为路点
+        #     waypoints = gt_traj
+        # else:
+        #     # 万一没读到轨迹，保底只飞终点
+        #     waypoints = [goal_pos]
         # #################################################################
 
         # 初始化 Recorder
@@ -439,7 +491,8 @@ class DroneRunner:
             current_yaw = curr_rot.as_euler('zyx')[0]
 
             # [VISUALIZATION] 更新 Follow Camera 位置
-            new_cam_pos = np.array([pos[0], pos[1], 12.0])
+            # new_cam_pos = np.array([pos[0], pos[1], 12.0])
+            new_cam_pos = np.array([pos[0], pos[1], pos[2] + 1.5])
             self.camera_map.set_world_pose(position=new_cam_pos)
             
             # 3. [RECORD] 记录数据与画图
@@ -456,20 +509,20 @@ class DroneRunner:
 
             # 裁判逻辑：还是看当前路点 (check_point)
             # 我们必须到了 p[i]，才能算通过，才能切换下一个
-            check_target = waypoints[current_wp_idx]
-            dist_to_check = np.linalg.norm(check_target - pos)
+            # check_target = waypoints[current_wp_idx]
+            # dist_to_check = np.linalg.norm(check_target - pos)
 
-            if dist_to_check < 0.2: # 判定通过的阈值
-                current_wp_idx += 1
-                if current_wp_idx >= len(waypoints):
-                    current_wp_idx = len(waypoints) - 1
+            # if dist_to_check < 0.2: # 判定通过的阈值
+            #     current_wp_idx += 1
+            #     if current_wp_idx >= len(waypoints):
+            #         current_wp_idx = len(waypoints) - 1
             
-            # 导航逻辑：给 Server 看前视点 (aim_point)
-            lookahead_t = 3  # [调节这个 t]：t 越大，看越远，飞得越快越平滑，但太大会切内圈
+            # # 导航逻辑：给 Server 看前视点 (aim_point)
+            # lookahead_t = 5  # [调节这个 t]：t 越大，看越远，飞得越快越平滑，但太大会切内圈
             
-            # 防止索引越界
-            aim_idx = min(current_wp_idx + lookahead_t, len(waypoints) - 1)
-            aim_target = waypoints[aim_idx] 
+            # # 防止索引越界
+            # aim_idx = min(current_wp_idx + lookahead_t, len(waypoints) - 1)
+            # aim_target = waypoints[aim_idx] 
             # =============================================================
             # =============================================================
 
@@ -483,31 +536,31 @@ class DroneRunner:
 
             policy_data = np.concatenate([pos, ori]) # [TEST ONLY]目前状态，接模型应该不给这个，仅测试用
             # [TEST ONLY] Obs 这个是加上起终点的，只是用来测试，真实模型不给这个，用下面那个
-            obs = {
-                "rgb": rgb[:, :, :3] if rgb is not None else np.zeros((360, 640, 3)),
-                "depth": depth if depth is not None else np.zeros((360, 640)),
-                # "goal_pose": goal_pos,      #正常运行用的
-                "goal_pose": aim_target,  #测试用的，加了几个waypoints的
-                "policy": policy_data, 
-                "instruction": instruction, # 传入指令
-                "step": step_count,
-                "collision": is_col
-            }
-
-            # [MODEL INTERFACE] 构造 Observation真实模型obs，真实接模型用这个
             # obs = {
             #     "rgb": rgb[:, :, :3] if rgb is not None else np.zeros((360, 640, 3)),
             #     "depth": depth if depth is not None else np.zeros((360, 640)),
-            #     "instruction": instruction, # 核心输入：告诉模型去哪
-            #     "step": step_count,         # 步数
-            #     "compass": np.array([yaw_rad]), # 朝向 (Radians)
-            #     "gps": rel_gps[:2],             # 相对位移 (只取x,y，通常不看高度z)
-            #     "collision": is_col             # 碰撞检测
+            #     # "goal_pose": goal_pos,      #正常运行用的
+            #     "goal_pose": aim_target,  #测试用的，加了几个waypoints的
+            #     "policy": policy_data, 
+            #     "instruction": instruction, # 传入指令
+            #     "step": step_count,
+            #     "collision": is_col
             # }
+
+            # [MODEL INTERFACE] 构造 Observation真实模型obs，真实接模型用这个
+            obs = {
+                "rgb": rgb[:, :, :3] if rgb is not None else np.zeros((360, 640, 3)),
+                "depth": depth if depth is not None else np.zeros((360, 640)),
+                "instruction": instruction, # 核心输入：告诉模型去哪
+                "step": step_count,         # 步数
+                "compass": np.array([yaw_rad]), # 朝向 (Radians)
+                "gps": rel_gps[:2],             # 相对位移 (只取x,y，通常不看高度z)
+                "collision": is_col             # 碰撞检测
+            }
 
 
             # =============================================================
-            # 🔥 [NEW] 核心推理逻辑：Buffer 机制 🔥
+            # 🔥 核心推理逻辑：Buffer 机制 🔥
             # =============================================================           
             # 初始化当前步的动作
             dx, dy, dz, yaw_deg = 0.0, 0.0, 0.0, 0.0
@@ -577,35 +630,37 @@ class DroneRunner:
             # print(f"线速度大小: {linear_speed:.2f} m/s | 速度向量: {target_velocity} | 角速度: {target_angular_vel}")
 
             # 6. [STOP] 停止条件
+            
             # [TEST ONLY]这个是测试的时候用的！因为加了waypoints不让他中间就停下
-            if server_stop:
-                # 情况 1：只是到了中间的一个路点 -> 切下一个，继续飞
-                if current_wp_idx < len(waypoints) - 1:
-                    # print(f"✅ Waypoint {current_wp_idx} Reached. Next!") # 调试用
-                    current_wp_idx += 1
-                    current_target = waypoints[current_wp_idx]
-                    # 注意：这里不要 break，让循环继续，去追下一个点
+            # if server_stop:
+            #     # 情况 1：只是到了中间的一个路点 -> 切下一个，继续飞
+            #     if current_wp_idx < len(waypoints) - 1:
+            #         # print(f"✅ Waypoint {current_wp_idx} Reached. Next!") # 调试用
+            #         current_wp_idx += 1
+            #         current_target = waypoints[current_wp_idx]
+            #         # 注意：这里不要 break，让循环继续，去追下一个点
                     
-                # 情况 2：确实是最后一个点 -> 任务结束
-                else:
-                    print("🎉 Mission Complete (All Waypoints Covered).")
-                    # 悬停一会儿再退
-                    for _ in range(20): 
-                        self.drone.set_linear_velocity(np.zeros(3))
-                        self.drone.set_angular_velocity(np.zeros(3))
-                        self.world.step(render=True)
-                    break
+            #     # 情况 2：确实是最后一个点 -> 任务结束
+            #     else:
+            #         print("🎉 Mission Complete (All Waypoints Covered).")
+            #         # 悬停一会儿再退
+            #         for _ in range(20): 
+            #             self.drone.set_linear_velocity(np.zeros(3))
+            #             self.drone.set_angular_velocity(np.zeros(3))
+            #             self.world.step(render=True)
+            #         break
 
             # [MODEL]模型预测的时候用下面这个就行
-            # if server_stop:
-            #     print("✅ Server requested STOP. Mission Complete.")
-            #     # 悬停展示一会儿
-            #     for _ in range(20): 
-            #         # 给一个 0 速度让它稳住
-            #         self.drone.set_linear_velocity(np.zeros(3))
-            #         self.drone.set_angular_velocity(np.zeros(3))
-            #         self.world.step(render=True)
-            #     break
+            if server_stop:
+                print("✅ Server requested STOP. Mission Complete.")
+                # 悬停展示一会儿
+                for _ in range(20): 
+                    # 给一个 0 速度让它稳住
+                    self.drone.set_linear_velocity(np.zeros(3))
+                    self.drone.set_angular_velocity(np.zeros(3))
+                    self.world.step(render=True)
+                break
 
-        recorder.save(episode_id)
+        ep_metrics = recorder.save(episode_id)
         print(f"🏁 Episode {episode_id} Done.")
+        return ep_metrics
